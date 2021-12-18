@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from PIL import Image
+from pkg_resources import require
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -131,7 +132,7 @@ def main():
         raise RuntimeError('The weights must not sum to 0.')
     weights /= weights.sum().abs()
 
-    clip_embed = F.normalize(target_embeds.mul(weights[:, None]).sum(0, keepdim=True), dim=-1)
+    clip_embed = F.normalize(target_embeds.sum(1, keepdim=True), dim=-1)
     clip_embed = clip_embed.repeat([args.n, 1])
 
     torch.manual_seed(args.seed)
@@ -141,7 +142,7 @@ def main():
         image_embeds = clip_model.encode_image(clip_in).view([cutn, x.shape[0], -1])
         losses = spherical_dist_loss(image_embeds, clip_embed[None])
         loss = losses.mean(0).sum() * args.clip_guidance_scale
-        grad = -torch.autograd.grad(loss, x)[0]
+        grad = -torch.autograd.grad(nn.Variable(loss, requires_grad=True), x)[0]
         return grad
 
     def run(x, clip_embed):

@@ -131,3 +131,50 @@ def reverse_sample(model, x, steps, extra_args, callback=None):
         x = pred * alphas[i + 1] + eps * sigmas[i + 1]
 
     return x
+
+
+def phi_transfer_step(x, eps, alpha, alpha_next):
+    # N.B. not clear if this is alpha _the noise_ or alpha _the signal_ --> just doing the formula
+    x_part = torch.sqrt(alpha_next / alpha) * x
+    eps_part_num = alpha_next - alpha
+    eps_part_denom = (
+        torch.sqrt(alpha) * 
+        (
+            torch.sqrt((1 - alpha_next) * alpha) + 
+            torch.sqrt((1 - alpha) * alpha_next)
+        )
+    )
+    eps_part = (eps_part_num / eps_part_denom) * eps
+    return x_part - eps_part
+
+
+
+def model_one_step(model, x, steps, i, alphas, sigmas, extra_args):
+    ts = x.new_ones([x.shape[0]])
+    # Get the model output (v, the predicted velocity)
+    with torch.cuda.amp.autocast():
+        v = model(x, ts * steps[i], **extra_args).float()
+
+    # Predict the noise and the denoised image
+    pred = x * alphas[i] - v * sigmas[i]
+    eps = x * sigmas[i] + v * alphas[i]
+    return pred, eps
+
+
+
+
+def linear_multistep_update(x, eps, alphas, sigmas, index):
+    pass
+
+
+def rk_update(x, eps, alphas, index):
+    alpha = alphas[index]
+    alpha_next = alphas[index + 1]
+    eps_1 = eps
+    x_1 = phi_transfer_step(x, eps_1, alpha, (alpha + alpha_next)/2)
+    v_2 =  
+
+
+@torch.no_grad
+def pdsn_sample():
+    pass

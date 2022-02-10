@@ -154,10 +154,9 @@ def model_one_step(model, x, step, alpha, sigma, extra_args):
     # Get the model output (v, the predicted velocity)
     with torch.cuda.amp.autocast():
         v = model(x, ts * step, **extra_args).float()
-
     # Predict the noise and the denoised image
-    pred = x *alpha - v * sigma
-    eps = x * sigma + v * alpha
+    pred = x * alpha - v * sigma
+    eps  = x * sigma + v * alpha
     return pred, eps
 
 
@@ -226,7 +225,7 @@ def pdsn_sample(model, x, steps, extra_args, callback=None):
 
             # Recombine the predicted noise and predicted denoised image in the
             # correct proportions for the next step
-            x = pred * alphas[i + 1] + eps * sigmas[i + 1]
+            x = pred # is x just equal to pred? * alphas[i + 1] + eps * sigmas[i + 1]
 
     # If we are on the last timestep, output the denoised image
     return pred

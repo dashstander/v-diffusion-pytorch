@@ -131,7 +131,7 @@ def main():
         return v
 
     def run(x, steps):
-        return sampling.pndm_sample(cfg_model_fn, x, steps, {})
+        return sampling.pdsn_sample(cfg_model_fn, x, steps, {})
 
     def run_all(n, batch_size):
         x = torch.randn([n, 3, side_y, side_x], device=device)

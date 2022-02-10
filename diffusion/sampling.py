@@ -174,16 +174,16 @@ def rk_update(model, x, eps, steps, index, extra_args):
     t_mid = (t_next + t) / 2
     alphas, sigmas = utils.t_to_alpha_sigma(torch.linspace(t, t_next, 3)) # calculate alpha & sigma for current time, next time, and midpoint
     sigma, sigma_mid, sigma_next = sigmas[0], sigmas[1], sigmas[2]
-    alpha, alpha_mid, alpha_next = alphas[0], alphas[1], alphas[2]
+    alpha_mid = alphas[1]
     eps_1 = eps
-    x_1 = phi_transfer_step(x, eps_1, alpha, alpha_mid)
+    x_1 = phi_transfer_step(x, eps_1, sigma, sigma_mid)
     _, eps_2 = model_one_step(model, x_1, t_mid, alpha_mid, sigma_mid, extra_args)
-    x_2 = phi_transfer_step(x, eps_2, alpha, alpha_mid)
+    x_2 = phi_transfer_step(x, eps_2, sigma, sigma_mid)
     _, eps_3 = model_one_step(model, x_2,  t_mid, alpha_mid, sigma_mid, extra_args)
-    x_3 = phi_transfer_step(x, eps_3, alpha, alpha_mid)
+    x_3 = phi_transfer_step(x, eps_3, sigma, sigma_mid)
     _, eps_4 = model_one_step(model, x_3, t_mid, alpha_mid, sigma_mid, extra_args)
     eps_rk = (eps_1 + 2 * eps_2 + 2 * eps_3 + eps_4) / 6
-    pred = phi_transfer_step(x, eps_rk, alpha, alpha_next)
+    pred = phi_transfer_step(x, eps_rk, sigma, sigma_next)
     return pred
 
 
@@ -219,13 +219,13 @@ def pdsn_sample(model, x, steps, extra_args, callback=None):
             if len(eps_cache) < 3:
                 pred = rk_update(model, pred, eps, steps, i, extra_args)
             else:
-                pred = linear_multistep_update(pred, eps, eps_cache, alphas[i], alphas[i+1])
+                pred = linear_multistep_update(pred, eps, eps_cache, sigmas[i], sigmas[i+1])
                 eps_cache.pop(0)
             eps_cache.append(eps)
 
             # Recombine the predicted noise and predicted denoised image in the
             # correct proportions for the next step
-            x = pred # is x just equal to pred? * alphas[i + 1] + eps * sigmas[i + 1]
+            x = pred * alphas[i + 1] + eps * sigmas[i + 1]
 
     # If we are on the last timestep, output the denoised image
     return pred

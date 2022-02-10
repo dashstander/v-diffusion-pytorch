@@ -49,8 +49,6 @@ def get_arguments():
                    help='the checkpoint to use')
     p.add_argument('--device', type=str,
                    help='the device to use')
-    p.add_argument('--eta', type=float, default=1.,
-                   help='the amount of noise to add during sampling (0-1)')
     p.add_argument('--init', type=str,
                    help='the init image')
     p.add_argument('--model', type=str, default='cc12m_1_cfg', choices=['cc12m_1_cfg'],
@@ -133,7 +131,7 @@ def main():
         return v
 
     def run(x, steps):
-        return sampling.sample(cfg_model_fn, x, steps, args.eta, {})
+        return sampling.pndm_sample(cfg_model_fn, x, steps, {})
 
     def run_all(n, batch_size):
         x = torch.randn([n, 3, side_y, side_x], device=device)

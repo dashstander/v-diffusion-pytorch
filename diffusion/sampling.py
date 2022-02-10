@@ -173,7 +173,7 @@ def linear_multistep_update(x, eps, prev_eps, alpha, alpha_next):
 def rk_update(model, x, eps, steps, index, extra_args):
     t, t_next = steps[index], steps[index + 1]
     t_mid = (t_next + t) / 2
-    alphas, sigmas = utils.t_to_alpha_sigma(t, t_next, 3) # calculate alpha & sigma for current time, next time, and midpoint
+    alphas, sigmas = utils.t_to_alpha_sigma(torch.linspace(t, t_next, 3)) # calculate alpha & sigma for current time, next time, and midpoint
     sigma, sigma_mid, sigma_next = sigmas[0], sigmas[1], sigmas[2]
     alpha, alpha_mid, alpha_next = alphas[0], alphas[1], alphas[2]
     eps_1 = eps

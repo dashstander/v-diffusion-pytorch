@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
-"""Classifier-free guidance sampling from a diffusion model."""
+"""Classifier-free guidance sampling from a diffusion model (PNDM sampling)
+See https://openreview.net/forum?id=PlKWVd2yBkY."""
 
 import argparse
 from functools import partial
+import math
 from pathlib import Path
 
 from PIL import Image
@@ -11,8 +13,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torchvision import transforms
+from torchvision import utils as tv_utils
 from torchvision.transforms import functional as TF
-from tqdm import trange
+from tqdm import trange, tqdm
 
 from CLIP import clip
 from diffusion import get_model, get_models, sampling, utils
@@ -36,7 +39,86 @@ def resize_and_center_crop(image, size):
     return TF.center_crop(image, size[::-1])
 
 
-def get_arguments():
+def make_eps_model_fn(model):
+    def eps_model_fn(x, t, **extra_args):
+        alphas, sigmas = utils.t_to_alpha_sigma(t)
+        v = model(x, t, **extra_args)
+        eps = x * sigmas[:, None, None, None] + v * alphas[:, None, None, None]
+        return eps
+    return eps_model_fn
+
+
+def make_autocast_model_fn(model, enabled=True):
+    def autocast_model_fn(*args, **kwargs):
+        with torch.cuda.amp.autocast(enabled):
+            return model(*args, **kwargs).float()
+    return autocast_model_fn
+
+
+def transfer(x, eps, t_1, t_2):
+    alphas, sigmas = utils.t_to_alpha_sigma(t_1)
+    next_alphas, next_sigmas = utils.t_to_alpha_sigma(t_2)
+    pred = (x - eps * sigmas[:, None, None, None]) / alphas[:, None, None, None]
+    x = pred * next_alphas[:, None, None, None] + eps * next_sigmas[:, None, None, None]
+    return x, pred
+
+
+def prk_step(model, x, t_1, t_2, extra_args):
+    eps_model_fn = make_eps_model_fn(model)
+    t_mid = (t_2 + t_1) / 2
+    eps_1 = eps_model_fn(x, t_1, **extra_args)
+    x_1, _ = transfer(x, eps_1, t_1, t_mid)
+    eps_2 = eps_model_fn(x_1, t_mid, **extra_args)
+    x_2, _ = transfer(x, eps_2, t_1, t_mid)
+    eps_3 = eps_model_fn(x_2, t_mid, **extra_args)
+    x_3, _ = transfer(x, eps_3, t_1, t_2)
+    eps_4 = eps_model_fn(x_3, t_2, **extra_args)
+    eps_prime = (eps_1 + 2 * eps_2 + 2 * eps_3 + eps_4) / 6
+    x_new, pred = transfer(x, eps_prime, t_1, t_2)
+    return x_new, eps_prime, pred
+
+
+def plms_step(model, x, old_eps, t_1, t_2, extra_args):
+    eps_model_fn = make_eps_model_fn(model)
+    eps = eps_model_fn(x, t_1, **extra_args)
+    eps_prime = (55 * eps - 59 * old_eps[-1] + 37 * old_eps[-2] - 9 * old_eps[-3]) / 24
+    x_new, pred = transfer(x, eps_prime, t_1, t_2)
+    return x_new, eps, pred
+
+
+@torch.no_grad()
+def prk_sample(model, x, steps, extra_args, callback=None):
+    """Draws samples from a model given starting noise."""
+    ts = x.new_ones([x.shape[0]])
+    model_fn = make_autocast_model_fn(model)
+    steps = torch.cat([steps, steps.new_zeros([1])])
+    for i in trange(len(steps) - 1, disable=None):
+        x, _, pred = prk_step(model, x, steps[i] * ts, steps[i + 1] * ts, extra_args)
+        if callback is not None:
+            callback({'x': x, 'i': i, 't': steps[i], 'pred': pred})
+    return pred
+
+
+@torch.no_grad()
+def plms_sample(model, x, steps, extra_args, callback=None):
+    """Draws samples from a model given starting noise."""
+    ts = x.new_ones([x.shape[0]])
+    model_fn = make_autocast_model_fn(model)
+    steps = torch.cat([steps, steps.new_zeros([1])])
+    old_eps = []
+    for i in trange(len(steps) - 1, disable=None):
+        if len(old_eps) < 3:
+            x, eps, pred = prk_step(model_fn, x, steps[i] * ts, steps[i + 1] * ts, extra_args)
+        else:
+            x, eps, pred = plms_step(model_fn, x, old_eps, steps[i] * ts, steps[i + 1] * ts, extra_args)
+            old_eps.pop(0)
+        old_eps.append(eps)
+        if callback is not None:
+            callback({'x': x, 'i': i, 't': steps[i], 'pred': pred})
+    return pred
+
+
+def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('prompts', type=str, default=[], nargs='*',
@@ -61,15 +143,10 @@ def get_arguments():
                    help='the output image size')
     p.add_argument('--starting-timestep', '-st', type=float, default=0.9,
                    help='the timestep to start at (used with init images)')
-    p.add_argument('--steps', type=int, default=500,
+    p.add_argument('--steps', type=int, default=50,
                    help='the number of timesteps')
-    args, _ = p.parse_known_args()
-    return args
+    args = p.parse_args()
 
-
-
-def main():
-    args = get_arguments()
     if args.device:
         device = torch.device(args.device)
     else:
@@ -130,8 +207,14 @@ def main():
         v = vs.mul(weights[:, None, None, None, None]).sum(0)
         return v
 
+    def display_callback(info):
+        # if info['i'] % display_every == 0:
+        nrow = math.ceil(info['pred'].shape[0]**0.5)
+        grid = tv_utils.make_grid(info['pred'], nrow, padding=0)
+        utils.to_pil_image(grid).save(f'pred_{info["i"]:05}.png')
+
     def run(x, steps):
-        return sampling.pdsn_sample(cfg_model_fn, x, steps, {})
+        return plms_sample(cfg_model_fn, x, steps, {})
 
     def run_all(n, batch_size):
         x = torch.randn([n, 3, side_y, side_x], device=device)

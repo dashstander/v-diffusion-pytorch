@@ -3,7 +3,6 @@
 """CLIP guided sampling from a diffusion model."""
 
 import argparse
-from functools import partial
 from pathlib import Path
 
 from PIL import Image
@@ -59,12 +58,6 @@ def parse_prompt(prompt):
     return vals[0], float(vals[1])
 
 
-def resize_and_center_crop(image, size):
-    fac = max(size[0] / image.size[0], size[1] / image.size[1])
-    image = image.resize((int(fac * image.size[0]), int(fac * image.size[1])), Image.LANCZOS)
-    return TF.center_crop(image, size[::-1])
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -78,26 +71,16 @@ def main():
                    help='the checkpoint to use')
     p.add_argument('--clip-guidance-scale', '-cs', type=float, default=500.,
                    help='the CLIP guidance scale')
-    p.add_argument('--cutn', type=int, default=16,
-                   help='the number of random crops to use')
-    p.add_argument('--cut-pow', type=float, default=1.,
-                   help='the random crop size power')
     p.add_argument('--device', type=str,
                    help='the device to use')
     p.add_argument('--eta', type=float, default=1.,
                    help='the amount of noise to add during sampling (0-1)')
-    p.add_argument('--init', type=str,
-                   help='the init image')
     p.add_argument('--model', type=str, default='cc12m_1', choices=get_models(),
                    help='the model to use')
     p.add_argument('-n', type=int, default=1,
                    help='the number of images to sample')
     p.add_argument('--seed', type=int, default=0,
                    help='the random seed')
-    p.add_argument('--size', type=int, nargs=2,
-                   help='the output image size')
-    p.add_argument('--starting-timestep', '-st', type=float, default=0.9,
-                   help='the timestep to start at (used with init images)')
     p.add_argument('--steps', type=int, default=1000,
                    help='the number of timesteps')
     args = p.parse_args()
@@ -110,8 +93,6 @@ def main():
 
     model = get_model(args.model)()
     _, side_y, side_x = model.shape
-    if args.size:
-        side_x, side_y = args.size
     checkpoint = args.checkpoint
     if not checkpoint:
         checkpoint = MODULE_DIR / f'checkpoints/{args.model}.pth'
@@ -119,17 +100,12 @@ def main():
     if device.type == 'cuda':
         model = model.half()
     model = model.to(device).eval().requires_grad_(False)
-    clip_model_name = model.clip_model if hasattr(model, 'clip_model') else 'ViT-B/16'
-    clip_model = clip.load(clip_model_name, jit=False, device=device)[0]
+    clip_model = clip.load(model.clip_model, jit=False, device=device)[0]
     clip_model.eval().requires_grad_(False)
     normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                      std=[0.26862954, 0.26130258, 0.27577711])
-    make_cutouts = MakeCutouts(clip_model.visual.input_resolution, args.cutn, args.cut_pow)
-
-    if args.init:
-        init = Image.open(utils.fetch(args.init)).convert('RGB')
-        init = resize_and_center_crop(init, (side_x, side_y))
-        init = utils.from_pil_image(init).to(device)[None].repeat([args.n, 1, 1, 1])
+    cutn = 16
+    make_cutouts = MakeCutouts(clip_model.visual.input_resolution, cutn=cutn, cut_pow=1)
 
     target_embeds, weights = [], []
 
@@ -146,7 +122,7 @@ def main():
         batch = make_cutouts(TF.to_tensor(img)[None].to(device))
         embeds = F.normalize(clip_model.encode_image(normalize(batch)).float(), dim=-1)
         target_embeds.append(embeds)
-        weights.extend([weight / args.cutn] * args.cutn)
+        weights.extend([weight / cutn] * cutn)
 
     if not target_embeds:
         raise RuntimeError('At least one text or image prompt must be specified.')
@@ -163,34 +139,25 @@ def main():
 
     def cond_fn(x, t, pred, clip_embed):
         clip_in = normalize(make_cutouts((pred + 1) / 2))
-        image_embeds = clip_model.encode_image(clip_in).view([args.cutn, x.shape[0], -1])
+        image_embeds = clip_model.encode_image(clip_in).view([cutn, x.shape[0], -1])
         losses = spherical_dist_loss(image_embeds, clip_embed[None])
         loss = losses.mean(0).sum() * args.clip_guidance_scale
         grad = -torch.autograd.grad(nn.Variable(loss, requires_grad=True), x)[0]
         return grad
 
-    def run(x, steps, clip_embed):
-        if hasattr(model, 'clip_model'):
-            extra_args = {'clip_embed': clip_embed}
-            cond_fn_ = cond_fn
-        else:
-            extra_args = {}
-            cond_fn_ = partial(cond_fn, clip_embed=clip_embed)
-        if not args.clip_guidance_scale:
-            return sampling.sample(model, x, steps, args.eta, extra_args)
-        return sampling.cond_sample(model, x, steps, args.eta, extra_args, cond_fn_)
-
-    def run_all(n, batch_size):
-        x = torch.randn([n, 3, side_y, side_x], device=device)
+    def run(x, clip_embed):
         t = torch.linspace(1, 0, args.steps + 1, device=device)[:-1]
         steps = utils.get_spliced_ddpm_cosine_schedule(t)
-        if args.init:
-            steps = steps[steps < args.starting_timestep]
-            alpha, sigma = utils.t_to_alpha_sigma(steps[0])
-            x = init * alpha + x * sigma
+        extra_args = {'clip_embed': clip_embed}
+        if not args.clip_guidance_scale:
+            return sampling.sample(model, x, steps, args.eta, extra_args)
+        return sampling.cond_sample(model, x, steps, args.eta, extra_args, cond_fn)
+
+    def run_all(n, batch_size):
+        x = torch.randn([args.n, 3, side_y, side_x], device=device)
         for i in trange(0, n, batch_size):
             cur_batch_size = min(n - i, batch_size)
-            outs = run(x[i:i+cur_batch_size], steps, clip_embed[i:i+cur_batch_size])
+            outs = run(x[i:i+cur_batch_size], clip_embed[i:i+cur_batch_size])
             for j, out in enumerate(outs):
                 utils.to_pil_image(out).save(f'out_{i + j:05}.png')
 

@@ -5,20 +5,23 @@ from copy import deepcopy
 from functools import partial
 import math
 from pathlib import Path
-
 from PIL import Image
 import torch
-from torch import optim, nn
 from torch.fft import fftn
+from torch import optim, nn
 from torch.nn import functional as F
-from torch.random import get_rng_state
 from torch.utils import data
+from torchtyping import TensorType, patch_typeguard
 from torchvision import transforms, utils
 from torchvision.transforms import functional as TF
-from torch.cuda.amp.grad_scaler import GradScaler
 from tqdm import trange
 from tqdm.std import tqdm
+from typing import List, Optional, Tuple
 import wandb
+import numpy as np
+from torch.nn.parameter import Parameter
+from functools import reduce
+from functools import partial
 
 from CLIP import clip
 
@@ -44,7 +47,6 @@ p.add_argument('--grad-accum', type=int, default=8)
 # Define utility functions
 
 
-
 def stat_cuda(msg):
     print('--', msg)
     print('allocated: %dM, max allocated: %dM, reserved: %dM, max reserved: %dM' % (
@@ -53,6 +55,174 @@ def stat_cuda(msg):
         torch.cuda.memory_reserved() / 1024 / 1024,
         torch.cuda.max_memory_reserved() / 1024 / 1024
     ))
+
+
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes1, modes2):
+        super(SpectralConv2d, self).__init__()
+        """
+        2D Fourier layer. It does FFT, linear transform, and Inverse FFT.    
+        """
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1 #Number of Fourier modes to multiply, at most floor(N/2) + 1
+        self.modes2 = modes2
+
+        self.scale = (1 / (in_channels * out_channels))
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(
+                in_channels,
+                out_channels,
+                self.modes1,
+                self.modes2,
+                dtype=torch.cfloat
+            )
+        )
+        self.weights2 = nn.Parameter(
+            self.scale * torch.rand(
+                in_channels,
+                out_channels,
+                self.modes1,
+                self.modes2,
+                dtype=torch.cfloat
+            )
+        )
+
+    # Complex multiplication
+    def compl_mul2d(self, input, weights):
+        # (batch, in_channel, x,y ), (in_channel, out_channel, x,y) -> (batch, out_channel, x,y)
+        return torch.einsum("bixy,ioxy->boxy", input, weights)
+
+    def forward(self, x):
+        batchsize = x.shape[0]
+        #Compute Fourier coeffcients up to factor of e^(- something constant)
+        x_ft = torch.fft.rfft2(x)
+        # Multiply relevant Fourier modes
+        out_ft = torch.zeros(batchsize, self.out_channels,  x.size(-2), x.size(-1)//2 + 1, dtype=torch.cfloat, device=x.device)
+        out_ft[:, :, :self.modes1, :self.modes2] = \
+            self.compl_mul2d(x_ft[:, :, :self.modes1, :self.modes2], self.weights1)
+        out_ft[:, :, -self.modes1:, :self.modes2] = \
+            self.compl_mul2d(x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
+        #Return to physical space
+        x = torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+        return x
+
+
+class FNO2d(nn.Module):
+    def __init__(self, modes1, modes2,  width):
+        super(FNO2d, self).__init__()
+
+        """
+        The overall network. It contains 4 layers of the Fourier layer.
+        1. Lift the input to the desire channel dimension by self.fc0 .
+        2. 4 layers of the integral operators u' = (W + K)(u).
+            W defined by self.w; K defined by self.conv .
+        3. Project from the channel space to the output space by self.fc1 and self.fc2 .
+        input: the solution of the coefficient function and locations (a(x, y), x, y)
+        input shape: (batchsize, x=s, y=s, c=3)
+        output: the solution 
+        output shape: (batchsize, x=s, y=s, c=1)
+        """
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.width = width
+        self.padding = 9 # pad the domain if input is non-periodic
+        self.fc0 = nn.Linear(3, self.width) # input channel is 3: (a(x, y), x, y)
+
+        self.conv0 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+        self.conv1 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+        self.conv2 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+        self.conv3 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+        self.w0 = nn.Conv2d(self.width, self.width, 1)
+        self.w1 = nn.Conv2d(self.width, self.width, 1)
+        self.w2 = nn.Conv2d(self.width, self.width, 1)
+        self.w3 = nn.Conv2d(self.width, self.width, 1)
+
+        self.fc1 = nn.Linear(self.width, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        grid = self.get_grid(x.shape, x.device)
+        x = torch.cat((x, grid), dim=-1)
+        x = self.fc0(x)
+        x = x.permute(0, 3, 1, 2)
+        x = F.pad(x, [0,self.padding, 0,self.padding])
+
+        x1 = self.conv0(x)
+        x2 = self.w0(x)
+        x = x1 + x2
+        x = F.gelu(x)
+
+        x1 = self.conv1(x)
+        x2 = self.w1(x)
+        x = x1 + x2
+        x = F.gelu(x)
+
+        x1 = self.conv2(x)
+        x2 = self.w2(x)
+        x = x1 + x2
+        x = F.gelu(x)
+
+        x1 = self.conv3(x)
+        x2 = self.w3(x)
+        x = x1 + x2
+        x = x[..., :-self.padding, :-self.padding]
+        x = x.permute(0, 2, 3, 1)
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.fc2(x)
+        return x
+    
+    def get_grid(self, shape, device):
+        batchsize, size_x, size_y = shape[0], shape[1], shape[2]
+        gridx = torch.tensor(np.linspace(0, 1, size_x), dtype=torch.float)
+        gridx = gridx.reshape(1, size_x, 1, 1).repeat([batchsize, 1, size_y, 1])
+        gridy = torch.tensor(np.linspace(0, 1, size_y), dtype=torch.float)
+        gridy = gridy.reshape(1, 1, size_y, 1).repeat([batchsize, size_x, 1, 1])
+        return torch.cat((gridx, gridy), dim=-1).to(device)
+
+
+class ResNet(nn.Module):
+    def __init__(self, block, num_blocks, num_classes=10):
+        super(ResNet, self).__init__()
+        self.in_planes = 32
+
+        self.conv1 = SpectralConv2d(3, 32, modes=10)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.layer1 = self._make_layer(block, 32, num_blocks[0], stride=1, modes=3)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=1, modes=3)
+        self.layer3 = self._make_layer(block, 32, num_blocks[2], stride=1, modes=3)
+        self.layer4 = self._make_layer(block, 32, num_blocks[3], stride=1, modes=3)
+        self.linear1 = nn.Linear(32*64*block.expansion, num_classes)
+        # self.linear2 = nn.Linear(100, num_classes)
+
+    def _make_layer(self, block, planes, num_blocks, stride, modes=10):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride, modes))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = F.relu(out)
+        out = self.layer1(out)
+        # out = F.avg_pool2d(out, 2)
+        out = self.layer2(out)
+        # out = F.avg_pool2d(out, 2)
+        out = self.layer3(out)
+        # out = F.avg_pool2d(out, 2)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        # print(out.shape)
+        out = out.view(out.size(0), -1)
+        out = self.linear1(out)
+        # out = F.relu(out)
+        # out = self.linear2(out)
+        return out
+
 
 @torch.no_grad()
 def ema_update(model, averaged_model, decay):
@@ -138,12 +308,6 @@ class SkipBlock(nn.Module):
         return torch.cat([self.main(input), self.skip(input)], dim=1)
 
 
-class FourierBlock(nn.Module):
-
-    def __init__(self, skip=None):
-
-        pass
-
 
 class FourierFeatures(nn.Module):
     def __init__(self, in_features, out_features, std=1.):
@@ -168,7 +332,7 @@ class SelfAttention2d(nn.Module):
         self.out_proj = nn.Conv2d(c_in, c_in, 1)
         self.dropout = nn.Identity()  # nn.Dropout2d(dropout_rate, inplace=True)
 
-    def forward(self, input):
+    def forward(self, input: TensorType['batch', -1, -1, -1]):
         n, c, h, w = input.shape
         qkv = self.qkv_proj(self.norm(input))
         qkv = qkv.view([n, self.n_head * 3, c // self.n_head, h * w]).transpose(2, 3)
@@ -209,107 +373,130 @@ class DiffusionModel(nn.Module):
         self.net = nn.Sequential(   # 256x256
             conv_block(3 + 16, cs[0], cs[0]),
             conv_block(cs[0], cs[0], cs[0]),
-            # conv_block(cs[0], cs[0], cs[0]),
-            # conv_block(cs[0], cs[0], cs[0]),
+            SpectralConv2d(cs[0], cs[0], 128, 128),
+            #conv_block(cs[0], cs[0], cs[0]),
+            conv_block(cs[0], cs[0], cs[0]),
             SkipBlock([
                 self.down,  # 128x128
                 conv_block(cs[0], cs[1], cs[1]),
-                # conv_block(cs[1], cs[1], cs[1]),
-                # conv_block(cs[1], cs[1], cs[1]),
+                #conv_block(cs[1], cs[1], cs[1]),
+                SpectralConv2d(cs[1], cs[1], 64, 64),
+                conv_block(cs[1], cs[1], cs[1]),
                 conv_block(cs[1], cs[1], cs[1]),
                 SkipBlock([
                     self.down,  # 64x64
                     conv_block(cs[1], cs[2], cs[2]),
+                    #conv_block(cs[2], cs[2], cs[2]),
+                    SpectralConv2d(cs[2], cs[2], 64, 64),
                     conv_block(cs[2], cs[2], cs[2]),
-                    # conv_block(cs[2], cs[2], cs[2]),
-                    # conv_block(cs[2], cs[2], cs[2]),
+                    conv_block(cs[2], cs[2], cs[2]),
                     SkipBlock([
                         self.down,  # 32x32
                         conv_block(cs[2], cs[3], cs[3]),
                         conv_block(cs[3], cs[3], cs[3]),
-                        # conv_block(cs[3], cs[3], cs[3]),
-                        # conv_block(cs[3], cs[3], cs[3]),
+                        conv_block(cs[3], cs[3], cs[3]),
+                        conv_block(cs[3], cs[3], cs[3]),
                         SkipBlock([
                             self.down,  # 16x16
                             conv_block(cs[3], cs[4], cs[4]),
-                            SelfAttention2d(cs[4], cs[4] // 64),
+                            SpectralConv2d(cs[4], cs[4], 8, 8),
                             conv_block(cs[4], cs[4], cs[4]),
-                            SelfAttention2d(cs[4], cs[4] // 64),
-                            # conv_block(cs[4], cs[4], cs[4]),
+                            SpectralConv2d(cs[4], cs[4], 8, 8),
+                            conv_block(cs[4], cs[4], cs[4]),
                             # SelfAttention2d(cs[4], cs[4] // 64),
-                            # conv_block(cs[4], cs[4], cs[4]),
+                            SpectralConv2d(cs[4], cs[4], 8, 8),
+                            conv_block(cs[4], cs[4], cs[4]),
                             # SelfAttention2d(cs[4], cs[4] // 64),
+                            SpectralConv2d(cs[4], cs[4] // 64, 8, 8),
                             SkipBlock([
                                 self.down,  # 8x8
                                 conv_block(cs[4], cs[5], cs[5]),
-                                SelfAttention2d(cs[5], cs[5] // 64),
-                                # conv_block(cs[5], cs[5], cs[5]),
                                 # SelfAttention2d(cs[5], cs[5] // 64),
-                                # conv_block(cs[5], cs[5], cs[5]),
+                                SpectralConv2d(cs[5], cs[5] // 64, 4, 4),
+                                conv_block(cs[5], cs[5], cs[5]),
                                 # SelfAttention2d(cs[5], cs[5] // 64),
-                                # conv_block(cs[5], cs[5], cs[5]),
-                                # SelfAttention2d(cs[5], cs[5] // 64),
-                                # SkipBlock([
-                                #    self.down,  # 4x4
-                                #    conv_block(cs[5], cs[6], cs[6]),
-                                #    SelfAttention2d(cs[6], cs[6] // 64),
-                                #    conv_block(cs[6], cs[6], cs[6]),
-                                #    SelfAttention2d(cs[6], cs[6] // 64),
-                                    # conv_block(cs[6], cs[6], cs[6]),
-                                    # SelfAttention2d(cs[6], cs[6] // 64),
-                                    # conv_block(cs[6], cs[6], cs[6]),
-                                    # SelfAttention2d(cs[6], cs[6] // 64),
-                                    # conv_block(cs[6], cs[6], cs[6]),
-                                    # SelfAttention2d(cs[6], cs[6] // 64),
-                                    # conv_block(cs[6], cs[6], cs[6]),
-                                    # SelfAttention2d(cs[6], cs[6] // 64),
-                                    # conv_block(cs[6], cs[6], cs[6]),
-                                    # SelfAttention2d(cs[6], cs[6] // 64),
-                                #    conv_block(cs[6], cs[6], cs[5]),
-                                #    SelfAttention2d(cs[5], cs[5] // 64),
-                                #    self.up,
-                                #]),
-                                # conv_block(cs[5] * 2, cs[5], cs[5]),
+                                SpectralConv2d(cs[5], cs[5] // 64, 4, 4),
+                                conv_block(cs[5], cs[5], cs[5]),
                                 # SelfAttention2d(cs[5], cs[5] // 64),
                                 conv_block(cs[5], cs[5], cs[5]),
-                                SelfAttention2d(cs[5], cs[5] // 64),
-                                # conv_block(cs[5], cs[5], cs[5]),
+                                SpectralConv2d(cs[5], cs[5], 4, 4),
+                                # SelfAttention2d(cs[5], cs[5] // 64),
+                                SkipBlock([
+                                    self.down,  # 4x4
+                                    conv_block(cs[5], cs[6], cs[6]),
+                                    # SelfAttention2d(cs[6], cs[6] // 64),
+                                    SpectralConv2d(cs[6], cs[6], 2, 2),
+                                    conv_block(cs[6], cs[6], cs[6]),
+                                    # SelfAttention2d(cs[6], cs[6] // 64),
+                                    SpectralConv2d(cs[6], cs[6], 2, 2),
+                                    conv_block(cs[6], cs[6], cs[6]),
+                                    SpectralConv2d(cs[6], cs[6], 2, 2),
+                                    conv_block(cs[6], cs[6], cs[6]),
+                                    #SelfAttention2d(cs[6], cs[6] // 64),
+                                    SpectralConv2d(cs[6], cs[6], 2, 2),
+                                    conv_block(cs[6], cs[6], cs[6]),
+                                    # SelfAttention2d(cs[6], cs[6] // 64),
+                                    SpectralConv2d(cs[6], cs[6], 2, 2),
+                                    conv_block(cs[6], cs[6], cs[6]),
+                                    # SelfAttention2d(cs[6], cs[6] // 64),
+                                    SpectralConv2d(cs[6], cs[6], 2, 2),
+                                    conv_block(cs[6], cs[6], cs[6]),
+                                    # SelfAttention2d(cs[6], cs[6] // 64),
+                                    SpectralConv2d(cs[6], cs[6], 2, 2),
+                                    conv_block(cs[6], cs[6], cs[5]),
+                                    # SelfAttention2d(cs[5], cs[5] // 64),
+                                    SpectralConv2d(cs[6], cs[6], 2, 2),
+                                    self.up,
+                                ]),
+                                conv_block(cs[5] * 2, cs[5], cs[5]),
+                                SpectralConv2d(cs[5], cs[5], 4, 4),
+                                #SelfAttention2d(cs[5], cs[5] // 64),
+                                conv_block(cs[5], cs[5], cs[5]),
+                                SpectralConv2d(cs[5], cs[5], 4, 4),
+                                # SelfAttention2d(cs[5], cs[5] // 64),
+                                conv_block(cs[5], cs[5], cs[5]),
+                                SpectralConv2d(cs[5], cs[5], 4, 4),
                                 # SelfAttention2d(cs[5], cs[5] // 64),
                                 conv_block(cs[5], cs[5], cs[4]),
-                                SelfAttention2d(cs[4], cs[4] // 64),
+                                SpectralConv2d(cs[5], cs[5], 4, 4),
+                                # SelfAttention2d(cs[4], cs[4] // 64),
                                 self.up,
                             ]),
                             conv_block(cs[4] * 2, cs[4], cs[4]),
-                            SelfAttention2d(cs[4], cs[4] // 64),
+                            # SelfAttention2d(cs[4], cs[4] // 64),
+                            SpectralConv2d(cs[4], cs[4], 8, 8),
                             conv_block(cs[4], cs[4], cs[4]),
-                            SelfAttention2d(cs[4], cs[4] // 64),
-                            # conv_block(cs[4], cs[4], cs[4]),
+                            SpectralConv2d(cs[4], cs[4], 8, 8),
+                            # SelfAttention2d(cs[4], cs[4] // 64),
+                            conv_block(cs[4], cs[4], cs[4]),
+                            SpectralConv2d(cs[4], cs[4], 8, 8),
                             # SelfAttention2d(cs[4], cs[4] // 64),
                             conv_block(cs[4], cs[4], cs[3]),
-                            SelfAttention2d(cs[3], cs[3] // 64),
+                            SpectralConv2d(cs[4], cs[4], 8, 8),
+                            # SelfAttention2d(cs[3], cs[3] // 64),
                             self.up,
                         ]),
                         conv_block(cs[3] * 2, cs[3], cs[3]),
                         conv_block(cs[3], cs[3], cs[3]),
-                        # conv_block(cs[3], cs[3], cs[3]),
+                        conv_block(cs[3], cs[3], cs[3]),
                         conv_block(cs[3], cs[3], cs[2]),
                         self.up,
                     ]),
                     conv_block(cs[2] * 2, cs[2], cs[2]),
                     conv_block(cs[2], cs[2], cs[2]),
-                    # conv_block(cs[2], cs[2], cs[2]),
+                    conv_block(cs[2], cs[2], cs[2]),
                     conv_block(cs[2], cs[2], cs[1]),
                     self.up,
                 ]),
                 conv_block(cs[1] * 2, cs[1], cs[1]),
                 conv_block(cs[1], cs[1], cs[1]),
-                # conv_block(cs[1], cs[1], cs[1]),
+                conv_block(cs[1], cs[1], cs[1]),
                 conv_block(cs[1], cs[1], cs[0]),
                 self.up,
             ]),
             conv_block(cs[0] * 2, cs[0], cs[0]),
             conv_block(cs[0], cs[0], cs[0]),
-            # conv_block(cs[0], cs[0], cs[0]),
+            conv_block(cs[0], cs[0], cs[0]),
             conv_block(cs[0], cs[0], 3, is_last=True),
         )
 

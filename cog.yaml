@@ -1,0 +1,25 @@
+# Configuration for Cog ⚙️
+# Reference: https://github.com/replicate/cog/blob/main/docs/yaml.md
+
+build:
+    # set to true if your model requires a GPU
+    gpu: true
+    # python version in the form '3.8' or '3.8.12'
+    python_version: "3.9"
+
+    # a list of packages in the format <package-name>==<version>
+    python_packages:
+        - "ftfy==6.1.1"
+        - "pip==22.0.3"
+        - "numpy==1.22.2"
+        - "torch==1.10.2"
+        - "torchvision==0.11.3"
+        - "tqdm==4.62.3"
+        - "torchtyping==0.1.4"
+        - "typeguard==2.13.3"
+        - "wandb==0.12.10"
+
+  # commands run after the environment is setup
+    run:
+        - "pip install git+https://github.com/openai/CLIP@master"
+    # - "echo another command if needed"
